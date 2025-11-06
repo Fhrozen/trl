@@ -238,7 +238,15 @@ class VLLMClient:
         url = f"{self.base_url}/generate/"
 
         # Convert PIL images to base64 strings
-        images = [pil_to_base64(img) for img in images] if images else None
+        if images:
+            _imgs = []
+            for imgs in images:
+                if isinstance(imgs, list):
+                    imgs = [pil_to_base64(img) for img in imgs]
+                else:
+                    imgs = pil_to_base64(imgs)
+                _imgs.append(imgs)
+            images = _imgs
 
         response = self.session.post(
             url,

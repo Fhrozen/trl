@@ -486,7 +486,7 @@ def main(script_args: ScriptArguments):
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
-        images: list[str] | None = None
+        images: list[str] | list[list[str]] | None = None
         n: int = 1
         repetition_penalty: float = 1.0
         temperature: float = 1.0
@@ -558,10 +558,12 @@ def main(script_args: ScriptArguments):
         request.images = request.images or [None] * len(request.prompts)
 
         prompts = []
-        for prompt, image in zip(request.prompts, request.images, strict=True):
+        for prompt, images in zip(request.prompts, request.images, strict=True):
             row = {"prompt": prompt}
-            if image is not None:
-                row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
+            if images is not None:
+                if isinstance(images, str):
+                    images = [images]
+                row["multi_modal_data"] = [{"image": Image.open(BytesIO(base64.b64decode(image)))} for image in images]
             prompts.append(row)
 
         # Guided decoding, if enabled
