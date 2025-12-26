@@ -49,16 +49,15 @@ from transformers.utils import ModelOutput, is_peft_available, is_rich_available
 from ...models.utils import create_reference_model, unwrap_model_for_generation
 from ...trainer.base_trainer import BaseTrainer
 from ...trainer.utils import (
-    batch_generation,
     disable_dropout_in_model,
     empty_cache,
-    first_true_indices,
-    get_reward,
     log_table_to_comet_experiment,
+    pad,
     peft_module_casting_to_bf16,
     prepare_deepspeed,
     selective_log_softmax,
 )
+from ..utils import first_true_indices, get_reward
 from .ppo_config import PPOConfig
 
 
@@ -74,6 +73,78 @@ if is_peft_available():
 
 
 INVALID_LOGPROB = 1.0
+
+
+def generate(
+    lm_backbone: torch.nn.Module, queries: torch.Tensor, pad_token_id: int, generation_config: GenerationConfig
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates sequences from the language model backbone in a way that does not affect padding tokens.
+
+    Args:
+        lm_backbone (`torch.nn.Module`):
+            The language model backbone used for generation.
+        queries (`torch.Tensor`):
+            The tensor containing the input queries.
+        pad_token_id (`int`):
+            The token ID representing the pad token.
+        generation_config ([`~transformers.GenerationConfig`]):
+            The configuration for the generation process.
+
+    Returns:
+        tuple:
+            - `generated_sequences` (`torch.Tensor`):
+                The concatenated tensor of input queries and generated sequences.
+            - `logits` (`torch.Tensor`):
+                The logits output from the generation process.
+    """
+    context_length = queries.shape[1]
+    attention_mask = queries != pad_token_id
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    output = lm_backbone.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
+        # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
+        generation_config=generation_config,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    logits = torch.stack(output.scores, 1)
+    return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
+
+
+@torch.no_grad()
+def batch_generation(
+    model: torch.nn.Module,
+    queries: torch.Tensor,
+    local_rollout_forward_batch_size: int,
+    pad_token_id: int,
+    generation_config: GenerationConfig,
+):
+    query_responses = []
+    logitss = []
+    batch_size = queries.shape[0]
+    for i in range(0, batch_size, local_rollout_forward_batch_size):
+        query = queries[i : i + local_rollout_forward_batch_size]
+        query_response, logits = generate(
+            model,
+            query,
+            pad_token_id,
+            generation_config,
+        )
+        query_responses.append(query_response)
+        logitss.append(logits)
+
+    # padding tensors
+    padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right")
+    padded_logitss = pad(logitss, padding_value=0, padding_side="right")
+
+    # reshaping
+    padded_query_responses = padded_query_responses.view(-1, padded_query_responses.shape[-1])[:batch_size]
+    padded_logitss = padded_logitss.view(-1, *padded_logitss.shape[2:])[:batch_size]
+
+    return padded_query_responses, padded_logitss
 
 
 def exact_div(a, b, custom_error_message=""):
@@ -327,9 +398,12 @@ class PPOTrainer(BaseTrainer):
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
             )
         elif is_peft_available() and peft_config is not None:
-            # if model is a peft model and we have a peft_confg, we merge and unload it first
             if isinstance(self.policy_model, PeftModel):
-                self.policy_model = self.policy_model.merge_and_unload()
+                raise ValueError(
+                    "You passed a `PeftModel` instance together with a `peft_config` to the trainer. Please first "
+                    "merge and unload the existing adapter, save the resulting base model, and then pass that base "
+                    "model along with the new `peft_config` to the trainer."
+                )
 
             # get peft model with the given config
             self.policy_model = get_peft_model(self.policy_model, peft_config)
@@ -529,13 +603,14 @@ class PPOTrainer(BaseTrainer):
                 yield from dataloader
 
         iter_dataloader = iter(repeat_generator())
-        generation_config = GenerationConfig(
-            max_new_tokens=args.response_length,
-            temperature=(args.temperature + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
+        generation_kwargs = {
+            "max_new_tokens": args.response_length,
+            "temperature": (args.temperature + 1e-7),
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+        }
+        generation_config = GenerationConfig(**generation_kwargs)
 
         accelerator.print("===training policy===")
         start_time = time.time()
@@ -590,9 +665,14 @@ class PPOTrainer(BaseTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                with unwrap_model_for_generation(
-                    self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model:
+                with (
+                    unwrap_model_for_generation(
+                        self.model,
+                        self.accelerator,
+                        gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                        generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+                    ) as unwrapped_model
+                ):
                     query_responses, logitss = batch_generation(
                         unwrapped_model.policy,
                         queries,
@@ -856,18 +936,24 @@ class PPOTrainer(BaseTrainer):
     def generate_completions(self, sampling: bool = False):
         args = self.args
         processing_class = self.processing_class
-        generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
-            temperature=(0.01 + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
+        generation_kwargs = {
+            "max_new_tokens": args.response_length,
+            "temperature": (0.01 + 1e-7),
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+        }
+        generation_config = GenerationConfig(**generation_kwargs)
 
         table = defaultdict(list)
-        with unwrap_model_for_generation(
-            self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-        ) as unwrapped_model:
+        with (
+            unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+            ) as unwrapped_model
+        ):
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():

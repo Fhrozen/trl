@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import dataclasses
 import importlib.resources as pkg_resources
 import json
 import os
 import random
 import socket
+import threading
 from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass
 from importlib.metadata import version
@@ -37,7 +39,6 @@ from torch.utils.data import Sampler
 from transformers import (
     AutoConfig,
     BitsAndBytesConfig,
-    GenerationConfig,
     PretrainedConfig,
     PreTrainedModel,
     is_comet_available,
@@ -363,82 +364,6 @@ def cap_exp(value, cap=-1):
     return torch.exp(torch.clamp(value, max=cap))
 
 
-SIMPLE_CHAT_TEMPLATE = "{% for message in messages %}{{message['role'].capitalize() + ': ' + message['content'] + '\n\n'}}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
-
-
-def first_true_indices(bools: torch.Tensor, dtype=torch.long) -> torch.Tensor:
-    """
-    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving the position of the
-    first True in each "row".
-
-    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
-
-    Args:
-        bools (`torch.Tensor`):
-            An N-dimensional boolean tensor.
-        dtype (`torch.dtype`, optional):
-            The desired data type of the output tensor. Defaults to `torch.long`.
-
-    Returns:
-        `torch.Tensor`:
-            An (N-1)-dimensional tensor of integers indicating the position of the first True in each row. If no True
-            value is found in a row, returns the length of the row.
-    """
-    row_len = bools.size(-1)
-    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
-    return torch.min(zero_or_index, dim=-1).values
-
-
-def get_reward(
-    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Computes the reward logits and the rewards for a given model and query responses.
-
-    Args:
-        model (`torch.nn.Module`):
-            The model used to compute the reward logits.
-        query_responses (`torch.Tensor`):
-            The tensor containing the query responses.
-        pad_token_id (`int`):
-            The token ID representing the pad token.
-        context_length (`int`):
-            The length of the context in the query responses.
-
-    Returns:
-        tuple:
-            - `reward_logits` (`torch.Tensor`):
-                The logits for the reward model.
-            - `final_rewards` (`torch.Tensor`):
-                The final rewards for each query response.
-            - `sequence_lengths` (`torch.Tensor`):
-                The lengths of the sequences in the query responses.
-    """
-    attention_mask = query_responses != pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    lm_backbone = getattr(model, model.base_model_prefix)
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    output = lm_backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-        use_cache=False,  # otherwise mistral-based RM would error out
-    )
-    reward_logits = model.score(output.hidden_states[-1])
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[
-            torch.arange(reward_logits.size(0), device=reward_logits.device),
-            sequence_lengths,
-        ].squeeze(-1),
-        sequence_lengths,
-    )
-
-
 def prepare_deepspeed(
     model: torch.nn.Module, per_device_train_batch_size: int, fp16: bool = False, bf16: bool = False
 ) -> torch.nn.Module:
@@ -495,107 +420,6 @@ def prepare_deepspeed(
     model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
     model.eval()
     return model
-
-
-def generate(
-    lm_backbone: torch.nn.Module, queries: torch.Tensor, pad_token_id: int, generation_config: GenerationConfig
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generates sequences from the language model backbone in a way that does not affect padding tokens.
-
-    Args:
-        lm_backbone (`torch.nn.Module`):
-            The language model backbone used for generation.
-        queries (`torch.Tensor`):
-            The tensor containing the input queries.
-        pad_token_id (`int`):
-            The token ID representing the pad token.
-        generation_config ([`~transformers.GenerationConfig`]):
-            The configuration for the generation process.
-
-    Returns:
-        tuple:
-            - `generated_sequences` (`torch.Tensor`):
-                The concatenated tensor of input queries and generated sequences.
-            - `logits` (`torch.Tensor`):
-                The logits output from the generation process.
-    """
-    context_length = queries.shape[1]
-    attention_mask = queries != pad_token_id
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
-    output = lm_backbone.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
-        # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
-        generation_config=generation_config,
-        return_dict_in_generate=True,
-        output_scores=True,
-    )
-    logits = torch.stack(output.scores, 1)
-    return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
-
-
-@torch.no_grad()
-def batch_generation(
-    model: torch.nn.Module,
-    queries: torch.Tensor,
-    local_rollout_forward_batch_size: int,
-    pad_token_id: int,
-    generation_config: GenerationConfig,
-):
-    query_responses = []
-    logitss = []
-    batch_size = queries.shape[0]
-    for i in range(0, batch_size, local_rollout_forward_batch_size):
-        query = queries[i : i + local_rollout_forward_batch_size]
-        query_response, logits = generate(
-            model,
-            query,
-            pad_token_id,
-            generation_config,
-        )
-        query_responses.append(query_response)
-        logitss.append(logits)
-
-    # padding tensors
-    padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right")
-    padded_logitss = pad(logitss, padding_value=0, padding_side="right")
-
-    # reshaping
-    padded_query_responses = padded_query_responses.view(-1, padded_query_responses.shape[-1])[:batch_size]
-    padded_logitss = padded_logitss.view(-1, *padded_logitss.shape[2:])[:batch_size]
-
-    return padded_query_responses, padded_logitss
-
-
-def truncate_right(
-    input_ids: torch.Tensor, stop_token_id: int, pad_token_id: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Truncates the input tensor from the right side after the first occurrence of the stop token.
-
-    Args:
-        input_ids (`torch.Tensor`):
-            The tensor containing the responses to be truncated
-        stop_token_id (`int`):
-            The token ID representing the stop token where truncation occurs
-        pad_token_id (`int`):
-            The token ID representing the pad token used to fill the truncated responses
-
-    Returns:
-        tuple:
-            - `output_ids` (`torch.Tensor`):
-                The truncated responses tensor with pad tokens filled after the stop token
-            - `mask` (`torch.Tensor`):
-                The mask tensor to indicate the padding tokens
-    """
-    trunc_idxs = first_true_indices(input_ids == stop_token_id).unsqueeze(-1)
-    new_size = [1] * (len(input_ids.size()) - 1) + [input_ids.shape[1]]
-    idxs = torch.arange(input_ids.shape[1], device=input_ids.device).view(*new_size)
-    output_ids = torch.masked_fill(input_ids, idxs > trunc_idxs, pad_token_id)
-    mask = torch.masked_fill(torch.ones_like(input_ids), idxs > trunc_idxs, 0)
-    return output_ids, mask
 
 
 def empty_cache() -> None:
@@ -1356,3 +1180,55 @@ def get_config_model_id(config: PretrainedConfig) -> str:
             The model identifier associated with the model configuration.
     """
     return getattr(config, "_name_or_path", "")
+
+
+def start_event_loop_in_daemon(
+    name: str | None = None,
+) -> tuple[threading.Thread, asyncio.AbstractEventLoop, threading.Event]:
+    """
+    This function creates a new daemon thread that runs the provided event loop.
+
+    Args:
+        name (`str`, *optional*):
+            Name of the thread. If `None`, the default thread naming will be used.
+
+    Returns:
+        `threading.Thread`:
+            The thread running the event loop.
+        `asyncio.AbstractEventLoop`:
+            The event loop being run in the thread.
+        `threading.Event`:
+            An event that is set when the loop is ready.
+    """
+    loop = asyncio.new_event_loop()
+    loop_ready_event = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready_event.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, name=name, daemon=True)
+    thread.start()
+    return thread, loop, loop_ready_event
+
+
+def shutdown_event_loop_in_daemon(
+    thread: threading.Thread | None,
+    loop: asyncio.AbstractEventLoop | None,
+) -> None:
+    """
+    Shutdown an asyncio event loop running in a separate thread.
+
+    This function stops the event loop and waits for the associated thread to finish execution.
+
+    Args:
+        thread (`threading.Thread`):
+            The thread running the event loop.
+        loop (`asyncio.AbstractEventLoop`):
+            The asyncio event loop to shut down.
+    """
+    if loop is None or thread is None:
+        return
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
