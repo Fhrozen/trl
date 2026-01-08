@@ -380,6 +380,8 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
         )
         labels = output["input_ids"].clone()
         labels[output["attention_mask"] == 0] = -100
+        output["pixel_values"] = output["pixel_values"].unsqueeze(0)
+        output["image_grid_thw"] = output["image_grid_thw"].unsqueeze(0)
         # We mask only padding tokens (-100) in the labels. Vision tokens are left unchanged because their handling in
         # loss computation has to be done by the model, and masking them here would be infeasible in practice as vision
         # token definitions vary across architectures.
@@ -1134,6 +1136,11 @@ class SFTTrainer(BaseTrainer):
         # This can be removed when this issue is fixed.
         # When using CP or SP, labels are pre-shifted, we must use shift_labels instead.
         labels = inputs["labels"] if "shift_labels" not in inputs else None
+
+        # Using DataCollatorVLM unsqueeze the image related to avoid any truncation in the batch dimension.
+        for tag in ["pixel_values", "image_grid_thw"]:
+            if tag in inputs:
+                inputs[tag] = inputs[tag].squeeze(0)
 
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
         inputs["use_cache"] = False
