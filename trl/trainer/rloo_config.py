@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 import warnings
 from dataclasses import dataclass, field
 
+import transformers
+from packaging.version import Version
 from transformers import TrainingArguments
 
 
@@ -117,8 +119,8 @@ class RLOOConfig(TrainingArguments):
             Model implementation to use for vLLM. Must be one of `"transformers"` or `"vllm"`. `"transformers"`: Use
             the `transformers` backend for model implementation. `"vllm"`: Use the `vllm` library for model
             implementation.
-        vllm_guided_decoding_regex (`str`, *optional*):
-            Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
+        vllm_structured_outputs_regex (`str`, *optional*):
+            Regex for vLLM structured outputs. If `None` (default), structured outputs is disabled.
 
         > Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
 
@@ -244,8 +246,8 @@ class RLOOConfig(TrainingArguments):
         },
     )
     # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
-    # was fixed in https://github.com/huggingface/transformers/pull/41322, but the fix has not yet been released. We
-    # add a temporary workaround here, which can be removed once the fix is available—likely in Transformers 4.57.2.
+    # was fixed in https://github.com/huggingface/transformers/pull/41322 and released in 4.57.5. We add a temporary
+    # workaround here, which can be removed once we drop support for versions older than 4.57.5.
     lr_scheduler_kwargs: dict | str | None = field(
         default=None,
         metadata={
@@ -419,9 +421,9 @@ class RLOOConfig(TrainingArguments):
             "usage low, but waking the engine adds host–device transfer latency."
         },
     )
-    vllm_guided_decoding_regex: str | None = field(
+    vllm_structured_outputs_regex: str | None = field(
         default=None,
-        metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
+        metadata={"help": "Regex for vLLM structured outputs. If `None` (default), structured outputs is disabled."},
     )
 
     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
@@ -583,14 +585,14 @@ class RLOOConfig(TrainingArguments):
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
-        if self.top_k is None:
-            self.top_k = 0
-            warnings.warn(
-                "The value `None` for `top_k` is deprecated and will raise an error in TRL 0.28. "
-                "Use `top_k=0` to disable top-k filtering instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
+
+        # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
+        # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
+        # (see https://github.com/huggingface/transformers/pull/43203) and is released (most likely in 5.0.0), we
+        # default to the recommended non-reentrant behavior here, while preserving any user-provided value.
+        if self.gradient_checkpointing and Version(transformers.__version__) < Version("5.0.0"):
+            self.gradient_checkpointing_kwargs = self.gradient_checkpointing_kwargs or {}
+            self.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
 
         super().__post_init__()
 

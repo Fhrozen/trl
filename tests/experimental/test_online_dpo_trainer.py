@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -408,7 +408,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
     @require_torch_accelerator
     def test_training_with_transformers_paged(self, config_name):
         if Version(transformers.__version__) < Version("4.57.0"):
-            pytest.xfail("Upstream bug in transformers (GH#40692). Fix merged; awaiting release >= 4.57.0")
+            pytest.xfail("Bug in transformers solved in GH#40692, released in 4.57.0.")
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
